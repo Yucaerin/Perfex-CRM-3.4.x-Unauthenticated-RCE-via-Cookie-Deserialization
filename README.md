@@ -453,28 +453,6 @@ exec functions available?
          3. If both fail → Report failure
 ```
 
----
-
-## Companion Tools
-
-### scan_path_disclosure.py — Mass Path Disclosure Scanner
-
-```bash
-python3 scan_path_disclosure.py list.txt
-```
-
-Scans a list of targets for error-based path disclosure. Outputs targets with leaked paths (ready for exploitation).
-
-### deser_exploit.py — Known Path Exploit
-
-```bash
-python3 deser_exploit.py https://crm.target.com /var/www/html/
-```
-
-Simplified exploit for when webroot is already known (skips auto-detection).
-
----
-
 ## Fix Recommendations
 
 ### Fix 1: Remove unserialize() from Authentication (Critical)
