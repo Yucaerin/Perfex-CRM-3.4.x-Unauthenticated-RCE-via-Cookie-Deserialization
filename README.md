@@ -516,11 +516,9 @@ $data = unserialize(base64_decode($payload), ['allowed_classes' => false]);
 | File | Description |
 |---|---|
 | `deser_auto.py` | Full automated exploit — auto path leak + RCE + stager + interactive shell |
-| `deser_exploit.py` | Simplified exploit with known/brute-force path |
-| `scan_path_disclosure.py` | Mass scanner for error-based path disclosure |
 | `cmd7.php` | mm0r1 UAF disable_functions bypass — PHP 7.3-8.1, param: `?cmd=` |
 | `cmd83.php` | TimeAfterFree disable_functions bypass — PHP 8.2-8.5, param: `?cmd=` |
-| `README_DESER.md` | This file |
+| `README.md` | This file |
 
 ---
 
